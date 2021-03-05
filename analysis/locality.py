@@ -91,7 +91,7 @@ def places2filtered(places, state):
     return [[url, article2filtered(article, state)] for url, article in places]
 
 def article2filtered(article, state):
-    return [place for place in article if get_state(place['result'][0]) == 'CO']
+    return [place for place in article if get_state(place['result'][0]) == state]
 
 from datetime import date, datetime, timedelta
 def datespan(startDate, endDate, delta=timedelta(days=1)):
