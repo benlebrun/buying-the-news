@@ -1,11 +1,15 @@
 import pickle
 import pandas as pd
 import os
+import math
 import numpy as np
 from itertools import chain
 from tqdm.notebook import tqdm
-import googlemaps 
-from geocode import Geoparse
+import geopy.distance
+try:
+    from geocode import Geoparse
+except Exception as e:
+    print(f'Failed to load Geoparse : {e}')
 from random import sample
 from collections import Counter
 gmap = False
@@ -13,12 +17,14 @@ gmap = False
 ############################
 ### preamble
 
-with open('../geocoding/queries.p', 'rb') as f:
+'''
+with open('queries.p', 'rb') as f:
     queries = pickle.load(f)
 
-with open('../geocoding/queries.p', 'rb') as f:
-    pub2loc = pickle.load(f)   
-    
+'''
+with open('pub2loc.p', 'rb') as f:
+    pub2loc = pickle.load(f)  
+
 def openDoc(name):
     with open(name, 'rb') as fp:
         return pickle.load(fp)
@@ -34,6 +40,14 @@ def get_state(loc):
     try:
         return [part['short_name'] for part in loc['address_components'] 
             		if part['types'] == ['administrative_area_level_1', 'political']][0]
+    except IndexError:
+        return -1
+    
+def get_country(loc):
+    ''' Takes in a result and returns country '''
+    try:
+        return [part['short_name'] for part in loc['address_components'] 
+            		if part['types'] == ['country', 'political']][0]
     except IndexError:
         return -1
 
@@ -52,13 +66,13 @@ def resolve(results, pub, pub2loc):
         return {'entity': results['entity'],
                 'result': [results['result'][result_states.index(pub_state)]]}
 
-def filter(result, pub):
+def filter(result, pub, pub2loc=pub2loc):
     ''' takes in result and filters it '''
     import re
     # remove common NER false positives
     days = r"Mon\.|Tue\.|Wed\.|Thu\.|Fri\.|Sat\.|Sun\."
     days2 = r"^\s?Mon$|^\s?Tue$|^\s?Wed$|^\s?Thu$|^\s?Fri$|^\s?Sat$|^\s?Sun$"
-    pols = r'^\s?(R\-)|^\s?(D\-)' # stuff like R-Arizona sometimes gets matched. we want to avoid this.
+    pols = r'^\s?(R\.?\-)|^\s?(D\.?\-)' # stuff like R-Arizona sometimes gets matched. we want to avoid this.
     if bool(re.search(days, result['entity'])) or bool(re.search(pols, result['entity'])) or bool(re.search(days2, result['entity'])):
         return []
     elif len(result['result']) != 1: 
@@ -66,7 +80,7 @@ def filter(result, pub):
     else:
         return result 
 
-def articles2places(articles, file2url, id2place, entity_types='GPE|LOC'):
+def articles2places(articles, file2url, id2place, queries, entity_types='GPE|LOC'):
     ''' Input is a list of articles (path to doc file) and returns list of lists containing
         gmap results for each entity in each article. '''
     all_places = []
@@ -74,12 +88,21 @@ def articles2places(articles, file2url, id2place, entity_types='GPE|LOC'):
         if f[-1] != 'p':
             doc = openDoc(f[:-3]+'p')
         else:
-            doc = openDoc(f)
+            try:
+                doc = openDoc(f)
+            except Exception as e:
+                print(e, ':', f)
         pub = file2url[f.split('/')[-1].split('.')[0]]
         try:
             geodoc = Geoparse(doc, pub, 'were not writing', 
                           queries, gmap, query=False, save=False)
-            places = [filter(id2place[ID], pub=pub) for ID in geodoc.get_places(entity_types) if ID != -1]
+            places = []
+            for entity, ID in geodoc.get_places(entity_types, return_ents=True):
+                if ID == -1:
+                    continue
+                place = id2place[ID].copy()
+                place['entity'] = entity
+                places.append(filter(place, pub=pub))
             places = [p for p in places if p != []]
         except Exception as e:
             print(e, ':', f)
@@ -91,39 +114,38 @@ def places2filtered(places, state):
     return [[url, article2filtered(article, state)] for url, article in places]
 
 def article2filtered(article, state):
-    return [place for place in article if get_state(place['result'][0]) == 'CO']
+    return [place for place in article if get_state(place['result'][0]) == state]
 
-from datetime import date, datetime, timedelta
-def datespan(startDate, endDate, delta=timedelta(days=1)):
-    currentDate = startDate
-    while currentDate <= endDate:
-        yield currentDate
-        currentDate += delta
+def places2ids(places):
+    for place in places:
+        for p in place[1]:
+            if len(p['result']) == 1:
+                place_ids.append(p['result'][0]['place_id'])
+            else:
+                place_ids.append(resolve(p, place[0].split('/')[2])['result'][0]['place_id'])
+    return place_ids
 
-def split_by_date(articles, url2date, days=7):
-    dates = [url2date[url] for url, article in articles]
-    start, end = min(dates), max(dates)
-    periods = {start_day : [] for start_day in datespan(start, end, delta=timedelta(days=1))}
-    for url, article in articles:
-        periods[url2date[url]].append([url, article])
-    def chunks(lst, n):
-        """Yield successive n-sized chunks from lst."""
-        for i in range(0, len(lst), n):
-            yield lst[i:i+n]
-    return {days[0]:list(chain(*[periods[d] for d in days])) for days in chunks(list(periods.keys()), n=days)} 
+def places2coords(places, approx=False):
+    if approx:
+         return [place2coords(place) 
+                for place in places]
+    else:
+        return [place2coords(place) 
+                for place in places if place['result'][0]['geometry']['location_type'] != 'APPROXIMATE']
+    
+def place2coords(place):
+    loc = place['result'][0]['geometry']['location']
+    return [loc['lng'], loc['lat']]
 
-def split_by_dates(places, url2date, pre_e, post_b, pre_b=None, post_e=None):    
-    if post_e is None:
-        post_e = max(url2date.values())
-    if pre_b is None:
-        pre_b = min(url2date.values())
-    pre_places, post_places = [], []
-    for url, place in places:
-        if (post_e >= url2date[url]) and (url2date[url] >= post_b):
-            post_places.append([url, place])
-        elif (pre_b <= url2date[url]) and (url2date[url] <= pre_e):
-            pre_places.append([url, place])
-    return pre_places, post_places
+def week2places(week):
+    return list(chain(*[places for url, places in week]))
+
+def cohend(d1, d2):
+    n1, n2 = len(d1), len(d2)
+    s1, s2 = np.var(d1, ddof=1), np.var(d2, ddof=1)
+    s = math.sqrt(((n1 - 1) * s1 + (n2 - 1) * s2) / (n1 + n2 - 2))
+    u1, u2 = np.mean(d1), np.mean(d2)
+    return (u1 - u2) / s
 
 ############################
 ### frequency
@@ -161,6 +183,10 @@ def gini(x):
     g = 0.5 * rmad
     return g
 
+def to_pmf(outcomes):
+    cnts=Counter(outcomes)
+    return np.asarray(list(cnts.values()))/sum(cnts.values())
+
 def places2zipf(places, s_size, return_counter=False):
     from collections import Counter
     all_places = []
@@ -186,6 +212,29 @@ def periods2entropy(periods):
     '''dict of periods -> place_id entropy for each period '''
     import scipy
     return np.array([[date, scipy.stats.entropy(articles2freqs(articles))] for date, articles in periods.items()])
+
+def places2levels(places, place2level):
+    levels = {'city':[], 'state':[], 'county':[], 'national':[], 'international':[]}
+    for place in places:
+        levels[place2level(place)].append(place)
+    return levels
+
+def places2ids(places):
+    return [place['result'][0]['place_id'] for place in places]
+
+def get_level_entropy(periods, level, place2level):
+    from scipy.stats import entropy
+    return [entropy(to_pmf(places2ids(places2levels(week2places(week), place2level)[level]))) for date, week in periods.items()]
+
+def get_level_mass(periods, level, place2level):
+    weights = []
+    for date, week in periods.items():
+        levels = {level:len(places) for level, places in places2levels(week2places(week), place2level).items()}
+        if sum(levels.values()) != 0:
+            weights.append(levels[level]/sum(levels.values()))
+    return weights
+
+
 
 ############################
 ### distance
@@ -237,130 +286,98 @@ def periods2distance(periods):
 ############################
 ### boolean locality
 
-def islocal(article, pub, pub2loc):
-    ''' takes in list of place objects and returns whether they are all in the 
-    state of the publication. '''
-    pub = pub.split('/')[2]
-    pub_state = get_state(pub2loc[pub])
-    for place in article:
-        if len(place['result']) > 1:
-            place = resolve(place, pub=pub)
-        state = get_state(place['result'][0])
-        if state == -1 or state != pub_state:
-            return False
-    return True
-
-def isNonlocal(article, pub, pub2loc):
-    ''' takes in list of place objects and returns whether none of them are in the 
-    state of the publication. '''
-    pub = pub.split('/')[2] # careful about what 'pub' should look like ... http://www.publication.com/article-title
-    pub_state = get_state(pub2loc[pub])
-    for place in article:
-        if len(place['result']) > 1:
-            place = resolve(place, pub=pub)
-        state = get_state(place['result'][0])
-        if state == pub_state:
-            if place['result'][0] == pub2loc[pub]:
-                continue
-            else:
-                return False
-    return True
-
-def isNonlocal_dist(article, pub, max_dist, pub2loc):
-    ''' takes in list of place objects and returns whether non of them 
-    are within a certain distance (in kms). '''
-    pub = pub.split('/')[2]
-    pub_loc = pub2loc[pub]['geometry']['location'].values()
-    for place in article:
+def article2distances(places, city_loc):
+    distances = []
+    for place in places:
         if len(place['result']) > 1:
             place = resolve(place, pub=pub)
         place_loc = place['result'][0]['geometry']['location'].values()
-        if geopy.distance.geodesic(tuple(pub_loc), tuple(place_loc)).km < max_dist:
-            return False  
-    return True
+        distances.append(get_dist(place_loc, city_loc))
+    return distances
 
-############################
-### toponym depth
+def articles2distances(articles, city_loc):
+    return [[url, article2distances(article, city_loc(url))] for url, article in articles]
 
-def place2depth(place, pub):
-    ''' input place object. returns depth of hierarchy '''
-    if len(place['result']) > 1:
-        place = resolve(results, pub=pub)
-    d = len(place['result'][0]['address_components'])
-    if d != 0:
-        return d-1
+def periods2distances(periods, city_loc):
+    ''' 
+    city_loc is a fct from url -> loc (simply ignore input in non mng cases)
+    i.e. sometimes the city location depends on url
+    '''
+    return {date:articles2distances(articles, city_loc)
+                     for date, articles in periods.items() if len(articles) > 0}
+
+def get_city(result):
+    ''' result dict -> city '''
+    try:
+        return [part['short_name'] for part in result['address_components'] 
+                    if part['types'] == ['locality', 'political']][0]
+    except IndexError:
+        return -1
+
+def get_sublocality(result):
+    ''' only used for NYDaily news '''
+    try:
+        return [part['short_name'] for part in result['address_components'] 
+                    if part['types'] == ['political', 'sublocality', 'sublocality_level_1']][0]
+    except IndexError:
+        return -1
+    
+def get_county(result):
+    try:
+        return [part['short_name'] for part in result['address_components']
+                if part['types'] == ['administrative_area_level_2', 'political']][0]
+    except IndexError:
+        return -1
+     
+def periods2bool(periods, bool_fct, ratio=True, input_url=False):
+    '''dict of periods, fct ->  applies fct to each article in each period '''
+    return np.array([[date, articles2bool(articles, bool_fct, ratio=ratio, input_url=input_url)] for date, articles in periods.items() if len(articles) > 0])
+
+def articles2bool(articles, bool_fct, ratio, input_url):
+    results = [bool_fct(article) if not input_url else bool_fct(article, url) for url, article in articles]
+    if ratio:
+        return sum(results)/len(results) if len(results) != 0 else np.nan
     else:
-        return np.nan
+        return sum(results) if len(results) != 0 else np.nan
 
-def article2depths(places, pub):
-    ''' input is list of place objects out is a list of depths '''
-    depths = [place2depth(place, pub.split('/')[2]) for place in places]
-    depths = np.array(depths)
-    return depths[~np.isnan(depths)]
 
-def articles2depths(articles):
-    ''' input is a list of lists of place objects. output is a list of list of depths '''
-    return [article2depths(places[1], places[0]) for places in articles]
-
-############################
-### trees?
-
-def address2tree(address):
-    tree = Tree()
-    address = list(reversed(address))
-    def helper(lst, tree, parent):
-        # base case
-        if len(lst) == 0:
-            return tree
+def within_city(article, city):
+    ''' list of article places -> boolean e.g. LA Weekly: city == Los Angeles'''
+    for place in article:
+        if get_city(place['result'][0]) == city:
+            return True
         else:
-            node = lst[0]
-            #parent_id = np.random.randint(10000000)
-            parent_id = parent+'/'+node['long_name']
-            tree.create_node(node['long_name'], parent_id, parent=parent, data=1)
-            return helper(lst[1:], tree, parent=parent_id)
-    while address[0]['types'][0] == 'postal_code_suffix' or address[0]['types'][0] == 'postal_code':
-        address = address[1:] 
-    #root_id = np.random.randint(10000000)
-    root_id = 'root'
-    tree.create_node('ROOT', root_id, data=1)
-    return helper(lst=address, tree=tree, parent=root_id)
+            continue
+    return False
 
-def paths2length(path1, path2):
-    i = 0
-    for p1, p2 in zip(path1, path2):
-        if p1 == p2:
-            i+=1
+def within_city_prop(article, city, prop):
+    cnt = 0
+    for place in article:
+        if get_city(place['result'][0]) == city:
+            cnt+=1
         else:
-            return i
-    return i
+            continue
+    return cnt/len(article) >= prop if len(article) != 0 else False
 
-def merge_trees(tree1, tree2):
-    ''' merges an address tree (just one path) to an article tree '''
-    path2 = tree2.paths_to_leaves()
-    assert len(path2) == 1
-    path2 = path2[0]
-    max_overlap = -1
-    best_path = -1
-    paths = tree1.paths_to_leaves()
-    # iterate over all possible paths
-    for i, path1 in enumerate(paths):
-        path_length = paths2length(path1, path2)
-        if path_length > max_overlap:
-            max_overlap=path_length
-            best_path = i
-    # get node to merge at
-    merge_node_id = paths[best_path][max_overlap-1]
-    # merge tree
-    tree1.merge(nid=merge_node_id, new_tree=tree2.subtree(nid=merge_node_id))
-    # increment nodes
-    for node in paths[best_path][0:max_overlap]:
-        tree1.get_node(node).data += 1
-    return tree1
+def add_ratios(results, ratios=np.arange(.05, 1.05, .05)):
+    assert len(results) == len(ratios)
+    new_results = []
+    for ratio, res in zip(ratios, results):
+        new_results.append(np.hstack((res, [[ratio] for _ in range(len(res))])))
+    return new_results
 
-def article2tree(places):
-    ''' input places objects and returns tree '''
-    tree = address2tree(places[0]['result'][0]['address_components'])
-    for place in places[1:]:
-        this_tree = address2tree(place['result'][0]['address_components'])
-        tree = merge_trees(tree, this_tree)
-    return tree
+def within_dist_prop(article, dist, prop) -> bool:
+    cnt = 0
+    for place_dist in article:
+        if place_dist <= dist:
+            cnt+=1
+        else:
+            continue
+    return cnt/len(article) >= prop if len(article) != 0 else False
+
+def within_range(loc1, loc2, max_dist) -> bool:
+    return get_dist(loc1, loc2) < max_dist
+
+def get_dist(loc1, loc2):
+    return geopy.distance.geodesic(tuple(loc1), tuple(loc2)).km
+
